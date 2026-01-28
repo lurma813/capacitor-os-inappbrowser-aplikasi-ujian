@@ -1,4 +1,10 @@
 package com.capacitorjs.osinappbrowser
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ComponentCallbacks2
+import android.content.Context
+import android.content.res.Configuration
 import androidx.lifecycle.lifecycleScope
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -9,94 +15,117 @@ import com.outsystems.plugins.inappbrowser.osinappbrowserlib.OSIABClosable
 import com.outsystems.plugins.inappbrowser.osinappbrowserlib.OSIABEngine
 import com.outsystems.plugins.inappbrowser.osinappbrowserlib.OSIABRouter
 import com.outsystems.plugins.inappbrowser.osinappbrowserlib.helpers.OSIABFlowHelper
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.OSIABAnimation
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.OSIABBottomSheet
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.OSIABCustomTabsOptions
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.OSIABToolbarPosition
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.OSIABViewStyle
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.OSIABWebViewOptions
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.routeradapters.OSIABCustomTabsRouterAdapter
-import com.outsystems.plugins.inappbrowser.osinappbrowserlib.routeradapters.OSIABExternalBrowserRouterAdapter
+import com.outsystems.plugins.inappbrowser.osinappbrowserlib.models.*
 import com.outsystems.plugins.inappbrowser.osinappbrowserlib.routeradapters.OSIABWebViewRouterAdapter
 
 @CapacitorPlugin(name = "InAppBrowser")
-class InAppBrowserPlugin : Plugin() {
+class InAppBrowserPlugin : Plugin(), ComponentCallbacks2 {
 
     private var engine: OSIABEngine? = null
     private var activeRouter: OSIABRouter<Boolean>? = null
 
+    /** WebView sudah benar-benar tampil */
+    private var webViewFullyOpened = false
+
     override fun load() {
         super.load()
-        this.engine = OSIABEngine()
+        engine = OSIABEngine()
+
+        // Daftarkan callback sistem
+        context.registerComponentCallbacks(this)
     }
 
-    @PluginMethod
-    fun openInExternalBrowser(call: PluginCall) {
-        handleBrowserCall(call, OSInAppBrowserTarget.EXTERNAL_BROWSER) { url ->
-            val externalBrowserRouter = OSIABExternalBrowserRouterAdapter(context)
-            engine?.openExternalBrowser(externalBrowserRouter, url) { success ->
-                handleBrowserResult(call, success, url, OSInAppBrowserTarget.EXTERNAL_BROWSER)
-            }
+    // =================================================
+    // ANDROID CALLBACK — UI BENAR-BENAR HILANG
+    // =================================================
+
+    override fun onTrimMemory(level: Int) {
+        if (level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            forceCloseWebViewAndClearClipboard()
         }
     }
 
-    @PluginMethod
-    fun openInSystemBrowser(call: PluginCall) {
-        handleBrowserCall(call, OSInAppBrowserTarget.SYSTEM_BROWSER) { url ->
-            val options = call.getObject("options")
-                ?: return@handleBrowserCall sendErrorResult(call, OSInAppBrowserError.InputArgumentsIssue(OSInAppBrowserTarget.SYSTEM_BROWSER))
-            // Try closing active router before continuing to open
-            close {
-                val customTabsOptions = buildCustomTabsOptions(options)
-                val customTabsRouter = OSIABCustomTabsRouterAdapter(
-                    context = context,
-                    lifecycleScope = activity.lifecycleScope,
-                    options = customTabsOptions,
-                    flowHelper = OSIABFlowHelper(),
-                    onBrowserPageLoaded = {
-                        notifyListeners(OSIABEventType.BROWSER_PAGE_LOADED.value, null)
-                    },
-                    onBrowserFinished = {
-                        notifyListeners(OSIABEventType.BROWSER_FINISHED.value, null)
-                    }
-                )
-                engine?.openCustomTabs(customTabsRouter, url) { success ->
-                    if (success) activeRouter = customTabsRouter
-                    handleBrowserResult(call, success, url, OSInAppBrowserTarget.SYSTEM_BROWSER)
-                }
-            }
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        // tidak dipakai
+    }
+
+    override fun onLowMemory() {
+        // optional
+    }
+
+    // =================================================
+    // FORCE CLOSE + CLEAR CLIPBOARD
+    // =================================================
+
+    private fun forceCloseWebViewAndClearClipboard() {
+        if (!webViewFullyOpened) return
+
+        (activeRouter as? OSIABClosable)?.close {
+            activeRouter = null
+            webViewFullyOpened = false
+
+            clearClipboard()
+
+            notifyListeners(
+                OSIABEventType.BROWSER_FINISHED.value,
+                JSObject()
+                    .put("reason", "app_backgrounded")
+                    .put("clipboardCleared", true)
+            )
         }
     }
+
+    private fun clearClipboard() {
+        try {
+            val clipboard =
+                context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(
+                ClipData.newPlainText("", "")
+            )
+        } catch (_: Exception) {
+            // Sengaja diabaikan — clipboard bukan operasi kritikal
+        }
+    }
+
+    // =================================================
+    // WEBVIEW
+    // =================================================
 
     @PluginMethod
     fun openInWebView(call: PluginCall) {
         handleBrowserCall(call, OSInAppBrowserTarget.WEB_VIEW) { url ->
             val options = call.getObject("options")
-                ?: return@handleBrowserCall sendErrorResult(call, OSInAppBrowserError.InputArgumentsIssue(OSInAppBrowserTarget.WEB_VIEW))
+                ?: return@handleBrowserCall sendErrorResult(
+                    call,
+                    OSInAppBrowserError.InputArgumentsIssue(OSInAppBrowserTarget.WEB_VIEW)
+                )
 
-            val customHeaders: Map<String, String>? = call.getObject("customHeaders")?.let { jsObject ->
-                val result = mutableMapOf<String, String>()
-                jsObject.keys().forEach { key ->
-                    when (val value = jsObject.opt(key)) {
-                        is String -> result[key] = value
-                        is Number -> result[key] = value.toString()
+            val customHeaders: Map<String, String>? =
+                call.getObject("customHeaders")?.let { js ->
+                    val map = mutableMapOf<String, String>()
+                    js.keys().forEach { key ->
+                        js.opt(key)?.let { value ->
+                            map[key] = value.toString()
+                        }
                     }
+                    map
                 }
-                result
-            }
 
             close {
                 val webViewOptions = buildWebViewOptions(options)
-                val webViewRouter = OSIABWebViewRouterAdapter(
+                val router = OSIABWebViewRouterAdapter(
                     context = context,
                     lifecycleScope = activity.lifecycleScope,
                     options = webViewOptions,
                     customHeaders = customHeaders,
                     flowHelper = OSIABFlowHelper(),
                     onBrowserPageLoaded = {
+                        webViewFullyOpened = true
                         notifyListeners(OSIABEventType.BROWSER_PAGE_LOADED.value, null)
                     },
                     onBrowserFinished = {
+                        activeRouter = null
+                        webViewFullyOpened = false
                         notifyListeners(OSIABEventType.BROWSER_FINISHED.value, null)
                     },
                     onBrowserPageNavigationCompleted = {
@@ -106,37 +135,49 @@ class InAppBrowserPlugin : Plugin() {
                         )
                     }
                 )
-                engine?.openWebView(webViewRouter, url) { success ->
-                    if (success) activeRouter = webViewRouter
+
+                engine?.openWebView(router, url) { success ->
+                    if (success) {
+                        activeRouter = router
+                        webViewFullyOpened = false
+                    }
                     handleBrowserResult(call, success, url, OSInAppBrowserTarget.WEB_VIEW)
                 }
             }
         }
     }
 
+    // =================================================
+    // CLOSE MANUAL
+    // =================================================
+
     @PluginMethod
     fun close(call: PluginCall) {
         close { success ->
-            if (success) {
-                call.resolve()
-            } else {
-                sendErrorResult(call, OSInAppBrowserError.CloseFailed)
-            }
+            if (success) call.resolve()
+            else sendErrorResult(call, OSInAppBrowserError.CloseFailed)
         }
     }
 
     private fun close(callback: (Boolean) -> Unit) {
-        (activeRouter as? OSIABClosable)?.let { closableRouter ->
-            closableRouter.close { success ->
-                if (success) {
-                    activeRouter = null
-                }
-                callback(success)
+        (activeRouter as? OSIABClosable)?.close { success ->
+            if (success) {
+                activeRouter = null
+                webViewFullyOpened = false
             }
+            callback(success)
         } ?: callback(false)
     }
 
-    private fun handleBrowserCall(call: PluginCall, target: OSInAppBrowserTarget, action: (String) -> Unit) {
+    // =================================================
+    // HELPERS
+    // =================================================
+
+    private fun handleBrowserCall(
+        call: PluginCall,
+        target: OSInAppBrowserTarget,
+        action: (String) -> Unit
+    ) {
         val url = call.getString("url")
         if (url.isNullOrEmpty()) {
             sendErrorResult(call, OSInAppBrowserError.InputArgumentsIssue(target))
@@ -148,86 +189,54 @@ class InAppBrowserPlugin : Plugin() {
         }
         try {
             action(url)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             sendErrorResult(call, OSInAppBrowserError.OpenFailed(url, target))
         }
     }
 
-    private fun handleBrowserResult(call: PluginCall, success: Boolean, url: String, target: OSInAppBrowserTarget) {
-        if (success) {
-            call.resolve()
-        } else {
-            sendErrorResult(call, OSInAppBrowserError.OpenFailed(url, target))
-        }
+    private fun handleBrowserResult(
+        call: PluginCall,
+        success: Boolean,
+        url: String,
+        target: OSInAppBrowserTarget
+    ) {
+        if (success) call.resolve()
+        else sendErrorResult(call, OSInAppBrowserError.OpenFailed(url, target))
     }
 
-    /**
-     * Parses options that come in a JSObject to create a 'OSIABWebViewOptions' object.
-     * @param options The options to open the URL in a WebView.
-     */
-    private fun buildWebViewOptions(options: JSObject): OSIABWebViewOptions {
-        return options.let {
-            val androidOptions = it.getJSObject("android")
-            OSIABWebViewOptions(
-                showURL = it.getBoolean("showURL", true) ?: true,
-                showToolbar = it.getBoolean("showToolbar", true) ?: true,
-                clearCache = it.getBoolean("clearCache", true) ?: true,
-                clearSessionCache = it.getBoolean("clearSessionCache", true) ?: true,
-                mediaPlaybackRequiresUserAction = it.getBoolean("mediaPlaybackRequiresUserAction", false) ?: false,
-                closeButtonText = it.getString("closeButtonText") ?: "Close",
-                toolbarPosition = it.getInteger("toolbarPosition")?.let { ordinal ->
-                    OSIABToolbarPosition.entries[ordinal]
-                } ?: OSIABToolbarPosition.TOP,
-                leftToRight = it.getBoolean("leftToRight", false) ?: false,
-                showNavigationButtons = it.getBoolean("showNavigationButtons", false) ?: false,
-                allowZoom = androidOptions?.getBoolean("allowZoom", true) ?: true,
-                hardwareBack = androidOptions?.getBoolean("hardwareBack", true) ?: true,
-                pauseMedia = androidOptions?.getBoolean("pauseMedia", true) ?: true,
-                customUserAgent = it.getString("customWebViewUserAgent", null)
-            )
-        }
-    }
-
-    /**
-     * Parses options that come in a JSObject to create a 'OSIABCustomTabs' object.
-     * @param options The options to open the URL in the system browser (Custom Tabs).
-     */
-    private fun buildCustomTabsOptions(options: JSObject): OSIABCustomTabsOptions {
-        val optionsJson = options.getJSObject("android")
-        return OSIABCustomTabsOptions(
-            showTitle = optionsJson?.getBoolean("showTitle", true) ?: true,
-            hideToolbarOnScroll = optionsJson?.getBoolean("hideToolbarOnScroll", false) ?: false,
-            viewStyle = optionsJson?.getInteger("viewStyle")?.let { OSIABViewStyle.entries[it] }
-                ?: OSIABViewStyle.FULL_SCREEN,
-            bottomSheetOptions = optionsJson?.getJSObject("bottomSheetOptions")?.let {
-                OSIABBottomSheet(
-                    height = it.getInteger("height", 1) ?: 1,
-                    isFixed = it.getBoolean("isFixed", false) ?: false
-                )
-            },
-            startAnimation = optionsJson?.getInteger("startAnimation")?.let { OSIABAnimation.entries[it] }
-                ?: OSIABAnimation.FADE_IN,
-            exitAnimation = optionsJson?.getInteger("exitAnimation")?.let { OSIABAnimation.entries[it] } ?: OSIABAnimation.FADE_OUT
-        )
-    }
-
-    /**
-     * Determines if URL scheme is valid - it must start with either 'http://' or 'https://'
-     * @param url string with URL to validate
-     */
     private fun isSchemeValid(url: String): Boolean {
-        return listOf("http://", "https://").any { url.startsWith(it, true) }
+        return url.startsWith("http://", true) || url.startsWith("https://", true)
     }
 
-    /**
-     * Helper method to send an error result using call.reject
-     * @param call The PluginCall object to send the error result
-     * @param error The OSInAppBrowserError object to send as the error result
-     */
     private fun sendErrorResult(call: PluginCall, error: OSInAppBrowserError) {
         call.reject(error.message, error.code)
     }
+
+    private fun buildWebViewOptions(options: JSObject): OSIABWebViewOptions {
+        val android = options.getJSObject("android")
+        return OSIABWebViewOptions(
+            showURL = options.getBoolean("showURL", true) ?: true,
+            showToolbar = options.getBoolean("showToolbar", true) ?: true,
+            clearCache = options.getBoolean("clearCache", true) ?: true,
+            clearSessionCache = options.getBoolean("clearSessionCache", true) ?: true,
+            mediaPlaybackRequiresUserAction = options.getBoolean("mediaPlaybackRequiresUserAction", false) ?: false,
+            closeButtonText = options.getString("closeButtonText") ?: "Close",
+            toolbarPosition = options.getInteger("toolbarPosition")
+                ?.let { OSIABToolbarPosition.entries[it] }
+                ?: OSIABToolbarPosition.TOP,
+            leftToRight = options.getBoolean("leftToRight", false) ?: false,
+            showNavigationButtons = options.getBoolean("showNavigationButtons", false) ?: false,
+            allowZoom = android?.getBoolean("allowZoom", true) ?: true,
+            hardwareBack = android?.getBoolean("hardwareBack", true) ?: true,
+            pauseMedia = android?.getBoolean("pauseMedia", true) ?: true,
+            customUserAgent = options.getString("customWebViewUserAgent", null)
+        )
+    }
 }
+
+// =================================================
+// EVENTS
+// =================================================
 
 enum class OSIABEventType(val value: String) {
     BROWSER_FINISHED("browserClosed"),
