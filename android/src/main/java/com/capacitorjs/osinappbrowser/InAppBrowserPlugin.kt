@@ -1,10 +1,14 @@
 package com.capacitorjs.osinappbrowser
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.res.Configuration
+import android.os.Build
+import androidx.core.app.NotificationCompat
 import androidx.lifecycle.lifecycleScope
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -27,12 +31,17 @@ class InAppBrowserPlugin : Plugin(), ComponentCallbacks2 {
     /** WebView sudah benar-benar tampil */
     private var webViewFullyOpened = false
 
+    companion object {
+        private const val NOTIFICATION_CHANNEL_ID = "webview_security"
+        private const val NOTIFICATION_ID = 1001
+    }
+
     override fun load() {
         super.load()
         engine = OSIABEngine()
 
-        // Daftarkan callback sistem
         context.registerComponentCallbacks(this)
+        createNotificationChannel()
     }
 
     // =================================================
@@ -54,7 +63,7 @@ class InAppBrowserPlugin : Plugin(), ComponentCallbacks2 {
     }
 
     // =================================================
-    // FORCE CLOSE + CLEAR CLIPBOARD
+    // FORCE CLOSE + CLEAR CLIPBOARD + NOTIFICATION
     // =================================================
 
     private fun forceCloseWebViewAndClearClipboard() {
@@ -65,6 +74,7 @@ class InAppBrowserPlugin : Plugin(), ComponentCallbacks2 {
             webViewFullyOpened = false
 
             clearClipboard()
+            showWebViewForceClosedNotification()
 
             notifyListeners(
                 OSIABEventType.BROWSER_FINISHED.value,
@@ -83,8 +93,44 @@ class InAppBrowserPlugin : Plugin(), ComponentCallbacks2 {
                 ClipData.newPlainText("", "")
             )
         } catch (_: Exception) {
-            // Sengaja diabaikan — clipboard bukan operasi kritikal
+            // clipboard bukan operasi kritikal
         }
+    }
+
+    // =================================================
+    // NOTIFICATION
+    // =================================================
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "WebView Security",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Notifikasi keamanan WebView"
+            }
+
+            val manager =
+                context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun showWebViewForceClosedNotification() {
+        val notification = NotificationCompat.Builder(context, NOTIFICATION_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("WebView ditutup")
+            .setContentText(
+                "WebView ditutup otomatis karena Anda meninggalkan aplikasi."
+            )
+            .setAutoCancel(true)
+            .build()
+
+        val manager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        manager.notify(NOTIFICATION_ID, notification)
     }
 
     // =================================================
